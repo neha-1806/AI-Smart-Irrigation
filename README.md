@@ -290,8 +290,14 @@ The reply carries any pending dashboard commands, which the ESP32 applies exactl
 | POST | `/api/device/mode` | `{ "auto": true }` switch AUTO / MANUAL |
 | POST | `/api/device/reset-flow` | Reset the litres counter |
 
-Set `ssid`, `password` and `BACKEND_HOST` (your PC's LAN IP) at the top of the sketch, run `npm start` in `backend/`,
-and flash the board. Commands are rejected with 503 while the ESP32 has been silent for more than 15 seconds.
+**Cloud (default).** The sketch posts over HTTPS to the Render backend, so the board and your laptop do not need to share a network; the board only needs Wi-Fi with internet.
+Copy `firmware/smart_irrigation_esp32/wifi_secrets.example.h` to `wifi_secrets.h` (git-ignored) and fill in your Wi-Fi name, password and a `BACKEND_DEVICE_KEY`.
+Set the same value as the `DEVICE_KEY` environment variable on Render: the backend then only accepts readings that carry it (header `X-Device-Key`).
+The upload runs in a background task, so a slow or sleeping server never delays the sensor and pump logic.
+
+**Local.** To test against a backend on your PC, set `BACKEND_HOST` to the PC's LAN IP, `BACKEND_PORT = 3000` and `BACKEND_USE_HTTPS = false`, then run `npm start` in `backend/`.
+
+Commands are rejected with 503 while the ESP32 has been silent for more than 15 seconds.
 
 ### Sign-in and roles
 

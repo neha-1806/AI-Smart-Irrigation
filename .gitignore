@@ -6,3 +6,4 @@ backend/data/
 
 # Arduino compile output
 firmware/**/build/
+firmware/**/wifi_secrets.h

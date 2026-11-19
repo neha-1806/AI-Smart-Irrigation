@@ -1,19 +1,28 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>   // Library Manager -> "ArduinoJson" (Benoit Blanchon)
 #include <DHT.h>
 
+// WIFI_SSID, WIFI_PASSWORD and BACKEND_DEVICE_KEY live in wifi_secrets.h
+// (same folder, never committed). Copy wifi_secrets.example.h to create it.
+#include "wifi_secrets.h"
+
 // ================= WIFI SETTINGS =================
-const char* ssid     = "USER1234567";
-const char* password = "12345678";
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // ================= BACKEND SETTINGS ==============
-// IP address of the PC running the Node backend (`npm start` in /backend).
-// The ESP32 and the PC must be on the same WiFi network.
-// Windows: run `ipconfig` and use the "IPv4 Address" of your Wi-Fi adapter.
-const char*    BACKEND_HOST       = "192.168.1.4";
-const uint16_t BACKEND_PORT       = 3000;
+// Default: the hosted backend on Render. The board only needs internet access,
+// it does NOT have to be on the same network as your laptop.
+const char*    BACKEND_HOST       = "ai-smart-irrigation.onrender.com";
+const uint16_t BACKEND_PORT       = 443;
+const bool     BACKEND_USE_HTTPS  = true;
+//
+// To test against a backend running on your own PC instead, use:
+//   BACKEND_HOST = "192.168.1.4" (your PC's IPv4), BACKEND_PORT = 3000,
+//   BACKEND_USE_HTTPS = false, and keep both on the same Wi-Fi.
 const unsigned long UPLOAD_INTERVAL_MS = 2000;   // send readings every 2 s
 
 // ================= EXACT PINOUT ==================
@@ -65,7 +74,6 @@ unsigned long lastUpdate = 0;
 
 // --- backend sync state (only used by the upload code) ---
 bool dhtValid = false;            // becomes true after the first good DHT11 read
-unsigned long lastUpload = 0;
 uint32_t lastCmdId = 0;           // newest dashboard command already applied
 
 // Water Flow Interrupt
@@ -235,10 +243,23 @@ void applyBackendCommand(const char* type, int value) {
   Serial.printf("Dashboard command applied: %s = %d\n", type, value);
 }
 
+// Connection and HTTP client are kept between uploads, so the HTTPS handshake
+// happens once and later uploads take a few milliseconds.
+WiFiClientSecure secureClient;
+WiFiClient plainClient;
+HTTPClient http;
+
+// Result of one upload attempt.
+const int UPLOAD_FAILED = -1;
+const int UPLOAD_OK = 0;
+const int UPLOAD_APPLIED_COMMAND = 1;
+
 // Sends the latest readings to the backend. The reply carries any pending
 // commands from the dashboard (pump on/off, auto/manual, reset litres).
-void sendToBackend() {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Runs in its own task (see uploadTask) so a slow network never delays the
+// sensor reading and pump logic in loop().
+int sendToBackend() {
+  if (WiFi.status() != WL_CONNECTED) return UPLOAD_FAILED;
 
   String tip = getSmartTip();
   tip.replace("\\", "");
@@ -261,22 +282,32 @@ void sendToBackend() {
   body += "\"lastCmdId\":" + String(lastCmdId);
   body += "}";
 
-  WiFiClient client;
-  HTTPClient http;
-  http.setConnectTimeout(1500);
-  http.setTimeout(2000);
-  if (!http.begin(client, BACKEND_HOST, BACKEND_PORT, "/api/sensor-data")) {
+  // A sleeping Render service can need up to a minute to wake: that only
+  // delays this task, never the pump logic.
+  http.setReuse(true);
+  http.setConnectTimeout(8000);
+  http.setTimeout(10000);
+
+  bool began = BACKEND_USE_HTTPS
+    ? http.begin(secureClient, BACKEND_HOST, BACKEND_PORT, "/api/sensor-data", true)
+    : http.begin(plainClient, BACKEND_HOST, BACKEND_PORT, "/api/sensor-data");
+  if (!began) {
     Serial.println("Backend: begin() failed");
-    return;
+    return UPLOAD_FAILED;
   }
   http.addHeader("Content-Type", "application/json");
+  if (strlen(BACKEND_DEVICE_KEY) > 0) http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
 
   int code = http.POST(body);
   if (code != 200) {
-    Serial.printf("Backend: upload failed (HTTP %d) -> http://%s:%u/api/sensor-data\n",
-                  code, BACKEND_HOST, (unsigned)BACKEND_PORT);
+    Serial.printf("Backend: upload failed (HTTP %d) -> %s://%s:%u\n",
+                  code, BACKEND_USE_HTTPS ? "https" : "http", BACKEND_HOST, (unsigned)BACKEND_PORT);
+    if (code < 0) Serial.println("  Cannot reach the server: check the Wi-Fi has internet. A sleeping Render service can take ~1 min to wake up.");
+    if (code == 401) Serial.println("  Device key rejected: BACKEND_DEVICE_KEY must equal DEVICE_KEY on the backend.");
     http.end();
-    return;
+    secureClient.stop();
+    plainClient.stop();
+    return UPLOAD_FAILED;
   }
 
   String reply = http.getString();
@@ -292,7 +323,7 @@ void sendToBackend() {
   DeserializationError err = deserializeJson(doc, reply, DeserializationOption::Filter(filter));
   if (err) {
     Serial.printf("Backend: reply parse error: %s\n", err.c_str());
-    return;
+    return UPLOAD_OK;
   }
 
   bool applied = false;
@@ -304,8 +335,18 @@ void sendToBackend() {
     applied = true;
   }
 
-  // Report the new state right away so the dashboard updates immediately.
-  if (applied) lastUpload = millis() - UPLOAD_INTERVAL_MS;
+  return applied ? UPLOAD_APPLIED_COMMAND : UPLOAD_OK;
+}
+
+// Background task (core 0): upload every UPLOAD_INTERVAL_MS. After applying a
+// dashboard command it reports the new state immediately; after a failure it
+// waits a little longer before trying again.
+void uploadTask(void* unused) {
+  for (;;) {
+    int result = sendToBackend();
+    if (result == UPLOAD_APPLIED_COMMAND) continue;
+    vTaskDelay(pdMS_TO_TICKS(result == UPLOAD_FAILED ? 5000 : UPLOAD_INTERVAL_MS));
+  }
 }
 
 // ================= SETUP =================
@@ -341,7 +382,7 @@ void setup() {
     Serial.println("\nWiFi Connected!");
     Serial.print("Dashboard URL -> http://");
     Serial.println(WiFi.localIP());
-    Serial.printf("Backend       -> http://%s:%u\n", BACKEND_HOST, (unsigned)BACKEND_PORT);
+    Serial.printf("Backend       -> %s://%s:%u\n", BACKEND_USE_HTTPS ? "https" : "http", BACKEND_HOST, (unsigned)BACKEND_PORT);
 
     server.on("/", handleRoot);
     server.on("/data", handleData);
@@ -352,6 +393,11 @@ void setup() {
   } else {
     Serial.println("\nWiFi not connected. Running in Offline AutoMode!");
   }
+
+  // Cloud upload runs beside loop(): HTTPS to the backend (no certificate
+  // pinning; the readings are not secret and the device key is only a gate).
+  secureClient.setInsecure();
+  xTaskCreatePinnedToCore(uploadTask, "upload", 16384, NULL, 1, NULL, 0);
 }
 
 // ================= MAIN LOOP =================
@@ -426,12 +472,6 @@ void loop() {
                   flowRateLPM,
                   pumpState ? "ON" : "OFF",
                   autoMode ? "AUTO" : "MANUAL");
-  }
-
-  // 8. Send readings to the backend and pick up dashboard commands
-  if (lastUpdate != 0 && millis() - lastUpload >= UPLOAD_INTERVAL_MS) {
-    lastUpload = millis();
-    sendToBackend();
   }
 }
 // ===== END OF CODE =====

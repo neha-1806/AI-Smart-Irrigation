@@ -225,7 +225,25 @@ app.get("/", (req, res) => {
 // SENSOR DATA
 // --------------------------------------------------
 
-app.post("/api/sensor-data", (req, res) => {
+// The ESP32 cannot sign in, so on a public server it proves itself with a shared
+// key (header X-Device-Key). Set DEVICE_KEY in the environment to require it;
+// when it is not set (local use) any device on the network may post.
+function requireDeviceKey(req, res, next) {
+    const expected = process.env.DEVICE_KEY;
+
+    if (!expected) return next();
+
+    const given = Buffer.from(String(req.get("x-device-key") || ""));
+    const wanted = Buffer.from(expected);
+
+    if (given.length === wanted.length && require("crypto").timingSafeEqual(given, wanted)) {
+        return next();
+    }
+
+    res.status(401).json({ error: "Wrong or missing device key." });
+}
+
+app.post("/api/sensor-data", requireDeviceKey, (req, res) => {
     if (
         !req.body ||
         typeof req.body !== "object" ||
