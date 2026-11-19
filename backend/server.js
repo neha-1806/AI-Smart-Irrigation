@@ -6,30 +6,12 @@ const http = require("http");
 const WebSocket = require("ws");
 const cors = require("cors");
 const { GoogleGenAI } = require("@google/genai");
-const {
-    createAuthRouter,
-    requireAuth,
-    requireRole,
-    verifyToken
-} = require("./auth");
+const db = require("./db");
 
 const app = express();
 const server = http.createServer(app);
 
-// Only signed-in users may open the live-data socket. Browsers cannot set
-// headers on a WebSocket, so the token travels as ?token=...
-const wss = new WebSocket.Server({
-    server,
-    verifyClient: ({ req }, done) => {
-        const token = new URL(req.url, "http://localhost").searchParams.get("token");
-        const user = verifyToken(token);
-
-        if (!user) return done(false, 401, "Unauthorized");
-
-        req.authUser = user.userId;
-        done(true);
-    }
-});
+const wss = new WebSocket.Server({ server });
 
 app.use(
     cors({
@@ -50,42 +32,6 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-// --------------------------------------------------
-// ACCESS CONTROL
-// --------------------------------------------------
-// Everything under /api needs a signed-in user, except:
-//   - the ESP32 posting its readings (the firmware has no login), and
-//   - the sign-in / sign-up calls themselves.
-// Role rules (admin vs viewer) are applied on the individual routes.
-
-const PUBLIC_API = new Set([
-    "POST /api/sensor-data",
-    "GET /api/auth/status",
-    "POST /api/auth/login",
-    "POST /api/auth/register"
-]);
-
-app.use("/api", (req, res, next) => {
-    const route = `${req.method} ${req.baseUrl}${req.path}`.replace(/\/+$/, "");
-
-    if (PUBLIC_API.has(route)) return next();
-
-    requireAuth(req, res, next);
-});
-
-app.use(
-    "/api/auth",
-    createAuthRouter({
-        // A deleted user's open live-data sockets are closed immediately.
-        onUserRemoved: (userId) => {
-            wss.clients.forEach((client) => {
-                if (client.authUser === userId) client.close(4401, "Account removed");
-            });
-        }
-    })
-);
-
-const adminOnly = requireRole("admin");
 
 let latestSensorData = null;
 let lastSensorAt = 0; // Date.now() of the last ESP32 packet
@@ -204,8 +150,7 @@ app.get("/", (req, res) => {
         message: "Smart Irrigation Backend is running",
         aiProvider: "Gemini",
         endpoints: [
-            "POST /api/auth/register | /api/auth/login | GET /api/auth/me",
-            "GET /api/sensor-data   (sign-in required; so is everything below except the ESP32 post)",
+            "GET /api/sensor-data",
             "POST /api/sensor-data   (ESP32 -> backend, replies with pending commands)",
             "GET /api/sensor-history",
             "GET /api/device/status",
@@ -243,6 +188,62 @@ function requireDeviceKey(req, res, next) {
     res.status(401).json({ error: "Wrong or missing device key." });
 }
 
+function makeHistoryPoint(data, t) {
+    const point = { t };
+
+    for (const key of [
+        "soil", "soilPercent", "ph", "temperature", "humidity", "flow", "totalLiters"
+    ]) {
+        const value = Number(data[key]);
+        if (data[key] !== null && data[key] !== undefined && Number.isFinite(value)) {
+            point[key] = value;
+        }
+    }
+
+    point.pump = truthyFlag(data.pump) ? 1 : 0;
+    point.rain = truthyFlag(data.rain) ? 1 : 0;
+
+    return point;
+}
+
+// The ESP32 posts every ~2 s. Neon gets one row every 10 s (or right away when
+// the pump or the mode changes), which is plenty for trends and keeps the
+// free database small.
+const DB_SAVE_EVERY_MS = 10000;
+let lastSavedAt = 0;
+let lastSavedState = "";
+
+function persistReading(data, atMs) {
+    if (!db.enabled()) return;
+
+    const state = `${truthyFlag(data.pump) ? 1 : 0}${truthyFlag(data.autoMode) ? 1 : 0}`;
+
+    if (atMs - lastSavedAt < DB_SAVE_EVERY_MS && state === lastSavedState) return;
+
+    lastSavedAt = atMs;
+    lastSavedState = state;
+    db.saveReading(data, atMs);
+}
+
+// After a restart or redeploy, bring back the last farm profile and readings so
+// the dashboard is not empty while the ESP32 reconnects.
+async function restoreState() {
+    const savedProfile = await db.loadFarmProfile();
+    if (savedProfile) farmProfile = { ...farmProfile, ...savedProfile };
+
+    const rows = await db.loadRecent(SENSOR_HISTORY_LIMIT);
+
+    // A live packet may already have arrived while the database was connecting.
+    if (rows.length && lastSensorAt === 0) {
+        sensorHistory = rows.map((row) => makeHistoryPoint(row.data, row.t));
+
+        const last = rows[rows.length - 1];
+        lastSensorAt = last.t;
+        latestSensorData = { ...last.data, receivedAt: new Date(last.t).toISOString() };
+        console.log(`Restored ${rows.length} readings from the database.`);
+    }
+}
+
 app.post("/api/sensor-data", requireDeviceKey, (req, res) => {
     if (
         !req.body ||
@@ -274,17 +275,7 @@ app.post("/api/sensor-data", requireDeviceKey, (req, res) => {
     }
     pruneCommands();
 
-    const historyPoint = { t: lastSensorAt };
-    for (const key of [
-        "soil", "soilPercent", "ph", "temperature", "humidity", "flow", "totalLiters"
-    ]) {
-        const value = Number(latestSensorData[key]);
-        if (latestSensorData[key] !== null && latestSensorData[key] !== undefined && Number.isFinite(value)) {
-            historyPoint[key] = value;
-        }
-    }
-    historyPoint.pump = truthyFlag(latestSensorData.pump) ? 1 : 0;
-    historyPoint.rain = truthyFlag(latestSensorData.rain) ? 1 : 0;
+    const historyPoint = makeHistoryPoint(latestSensorData, lastSensorAt);
 
     sensorHistory.push(historyPoint);
     if (sensorHistory.length > SENSOR_HISTORY_LIMIT) {
@@ -296,6 +287,8 @@ app.post("/api/sensor-data", requireDeviceKey, (req, res) => {
         data: latestSensorData,
         online: true
     });
+
+    persistReading(latestSensorData, lastSensorAt);
 
     console.log(
         `Sensor data received: soil=${latestSensorData.soil} (${latestSensorData.soilPercent}%) ` +
@@ -355,7 +348,7 @@ app.get("/api/device/status", (req, res) => {
 });
 
 // Manual pump switch. Like the ESP32's own /pump page this also leaves AUTO mode.
-app.post("/api/device/pump", adminOnly, (req, res) => {
+app.post("/api/device/pump", (req, res) => {
     const state = toBoolean(req.body?.state);
 
     if (state === null) {
@@ -372,7 +365,7 @@ app.post("/api/device/pump", adminOnly, (req, res) => {
     res.json({ message: "Pump command queued for the ESP32.", command });
 });
 
-app.post("/api/device/mode", adminOnly, (req, res) => {
+app.post("/api/device/mode", (req, res) => {
     const auto = toBoolean(req.body?.auto);
 
     if (auto === null) {
@@ -389,7 +382,7 @@ app.post("/api/device/mode", adminOnly, (req, res) => {
     res.json({ message: "Mode command queued for the ESP32.", command });
 });
 
-app.post("/api/device/reset-flow", adminOnly, (req, res) => {
+app.post("/api/device/reset-flow", (req, res) => {
     if (rejectIfOffline(res)) return;
 
     const command = enqueueCommand("resetFlow", 1);
@@ -406,7 +399,7 @@ app.get("/api/farm-profile", (req, res) => {
     res.json({ profile: farmProfile });
 });
 
-app.post("/api/farm-profile", adminOnly, (req, res) => {
+app.post("/api/farm-profile", (req, res) => {
     const { crop, soilType, city, farmArea } = req.body || {};
 
     farmProfile = {
@@ -431,8 +424,10 @@ app.post("/api/farm-profile", adminOnly, (req, res) => {
                 : farmProfile.farmArea
     };
 
+    db.saveFarmProfile(farmProfile);
+
     res.json({
-        message: "Farm profile saved for this server session.",
+        message: "Farm profile saved.",
         profile: farmProfile
     });
 });
@@ -775,9 +770,7 @@ const answer = interaction.output_text;
 // WEBSOCKET
 // --------------------------------------------------
 
-wss.on("connection", (ws, req) => {
-    ws.authUser = req.authUser;
-
+wss.on("connection", (ws) => {
     ws.send(
         JSON.stringify({
             type: "connection",
@@ -808,6 +801,16 @@ wss.on("connection", (ws, req) => {
 // --------------------------------------------------
 
 const port = Number(process.env.PORT) || 3000;
+
+// Database first (best effort), then restore the last state in the background.
+db.init()
+    .then((connected) => {
+        if (!connected) return;
+        db.prune(14);
+        setInterval(() => db.prune(14), 6 * 60 * 60 * 1000).unref();
+        return restoreState();
+    })
+    .catch((error) => console.error("Database startup error:", error.message));
 
 server.listen(port, () => {
     console.log(`Server running on http://localhost:${port}`);

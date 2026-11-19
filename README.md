@@ -159,7 +159,7 @@ AI-Smart-Irrigation/
 ├── frontend/
 │   ├── src/
 │   │   ├── App.jsx
-│   │   ├── auth.jsx           # sign-in page, user menu, account drawer
+│   │   ├── connect.jsx        # Connect ESP panel
 │   │   └── ...
 │   ├── package.json
 │   ├── package-lock.json
@@ -167,7 +167,7 @@ AI-Smart-Irrigation/
 │
 ├── backend/
 │   ├── server.js
-│   ├── auth.js                # accounts, tokens, roles
+│   ├── db.js                  # Neon (Postgres) storage
 │   ├── package.json
 │   ├── package-lock.json
 │   └── .env                 # Local secrets; do not commit
@@ -260,7 +260,7 @@ Keep the backend and frontend running in separate terminals.
 
 ## 🔌 API Documentation
 
-Every `/api` route requires a signed-in user (see [Sign-in and roles](#sign-in-and-roles)), except the ESP32 posting its readings and the sign-in / sign-up calls. Send the token as `Authorization: Bearer <token>`.
+There is no login: opening the dashboard link shows the live field straight away. Anyone who has the link can see the readings and switch the pump, so share it only with people you trust.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
@@ -272,9 +272,6 @@ Every `/api` route requires a signed-in user (see [Sign-in and roles](#sign-in-a
 | GET | `/api/weather` | Retrieve weather information |
 | GET | `/api/smart-recommendation` | Retrieve irrigation guidance |
 | POST | `/api/chat` | Submit a question to the AI assistant |
-| POST | `/api/auth/register` | Create an account (the first one becomes admin) |
-| POST | `/api/auth/login` | Sign in, returns a token |
-| GET | `/api/auth/me` | Current user and role |
 
 ### ESP32 ↔ backend protocol
 
@@ -299,26 +296,24 @@ The upload runs in a background task, so a slow or sleeping server never delays 
 
 Commands are rejected with 503 while the ESP32 has been silent for more than 15 seconds.
 
-### Sign-in and roles
+### Database (Neon) and deployment
 
-The dashboard opens on a sign-in page. Accounts use a **user ID and password**:
+The backend keeps the farm profile and sensor history in a **Neon** Postgres database, so nothing is lost when the free Render server restarts or redeploys:
 
-- Passwords are stored as salted scrypt hashes in `backend/data/users.json` (git-ignored), never in plain text.
-- A session is a signed token (7 days) kept in the browser. Changing your password signs out your other devices.
-- Five wrong passwords for the same user ID and address lock sign-in for 5 minutes.
-- The **first account created becomes the admin**. Later sign-ups are **viewers**. Set `ALLOW_SIGNUP=false` in `backend/.env` to close sign-up once your team has accounts.
-- Set `AUTH_SECRET` (16+ characters) in `backend/.env` to choose your own signing secret; otherwise one is generated into `backend/data/`.
+1. Create a project at [neon.tech](https://neon.tech) and copy its connection string (`postgresql://...`).
+2. Put it in `DATABASE_URL`: in `backend/.env` locally and in **Render → Environment** for the hosted backend.
+3. Restart the backend. It creates the tables itself (`sensor_readings`, `farm_profile`), stores one reading every 10 seconds (or at once when the pump or mode changes), deletes readings older than 14 days, and reloads the latest state on start.
 
-| | Viewer | Admin |
-|---|:---:|:---:|
-| Live readings, history, weather, recommendation | yes | yes |
-| AI assistant | yes | yes |
-| Pump on/off, AUTO/MANUAL, reset litres | no | yes |
-| Edit farm profile | no | yes |
-| Manage users (roles, delete) | no | yes |
+Without `DATABASE_URL` everything still works, but history only lives in memory.
 
-The live-data WebSocket needs the token too (`ws://host:3000/?token=...`).
-The ESP32 firmware has no login, so `POST /api/sensor-data` stays open to devices on your network; keep the backend off the public internet.
+| Variable | Where | Purpose |
+|---|---|---|
+| `DATABASE_URL` | Render / `.env` | Neon connection string |
+| `GEMINI_API_KEY`, `OPENWEATHER_API_KEY` | Render / `.env` | Assistant and weather |
+| `DEVICE_KEY` | Render / `.env` | Optional. When set, the ESP32 must send the same value as header `X-Device-Key` (`BACKEND_DEVICE_KEY` in `wifi_secrets.h`) |
+| `CORS_ORIGINS` | Render | Extra dashboard URLs, comma separated |
+
+The ESP32 and the dashboard both talk to the cloud server, so **they do not have to be on the same network**. If the board is off, the dashboard shows the last stored reading and the **Connect ESP** button; it wakes the server if it is asleep and waits until the board is seen.
 
 ### Example: Submit Sensor Data
 
@@ -360,7 +355,6 @@ Example request:
 ```bash
 curl -X POST http://localhost:3000/api/chat \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
   -d "{\"question\":\"How can I improve soil moisture management?\"}"
 ```
 
@@ -381,7 +375,7 @@ AI responses require a working Gemini integration and valid API configuration.
 - Add `.env` to `.gitignore`.
 - Never expose private API keys in frontend code or public commits.
 - Validate incoming sensor readings before using them for decisions.
-- Sign-in is built in (see above), but serve the app over HTTPS and keep the backend private before any public deployment.
+- The dashboard has no login. Anyone with the link can view data and control the pump, so do not publish the link widely. Set `DEVICE_KEY` so only your ESP32 can post readings.
 - Check sensor calibration before interpreting raw readings as actual soil moisture.
 - Treat AI-generated guidance as assistance, not a substitute for agricultural expertise.
 - Demo data, if used, must not be presented as live hardware readings.

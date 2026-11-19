@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { Bot, Gauge, Lightbulb, Radio, Settings2, Sprout } from "lucide-react";
+import { Bot, Gauge, Lightbulb, Plug, Radio, Settings2, Sprout } from "lucide-react";
 import { useAdvice, useDeviceControl, useSensors } from "./hooks.js";
 import { Toasts } from "./components.jsx";
 import { AdvicePage, FieldPage, ProfileDrawer, SensorsPage } from "./pages.jsx";
 import { AssistantPage, useChat } from "./chat.jsx";
-import { AccountDrawer, AuthPage, AuthSplash, UserMenu, useAuth } from "./auth.jsx";
+import { ConnectDrawer, useEspConnect } from "./connect.jsx";
 import { ago } from "./lib.js";
 
 const NAV = [
@@ -19,15 +19,7 @@ const pageFromHash = () => {
   return NAV.some((n) => n.id === id) ? id : "field";
 };
 
-// Signed-out visitors only ever see the login page: none of the data hooks below run until then.
 export default function App() {
-  const auth = useAuth();
-  if (auth.status === "loading") return <AuthSplash />;
-  if (auth.status !== "authed") return <AuthPage auth={auth} />;
-  return <Dashboard auth={auth} />;
-}
-
-function Dashboard({ auth }) {
   const s = useSensors();
   const [toasts, setToasts] = useState([]);
 
@@ -40,12 +32,13 @@ function Dashboard({ auth }) {
 
   const control = useDeviceControl(s.reading, notify);
   const advice = useAdvice(Boolean(s.reading), notify);
-  const chat = useChat(auth.user.userId);
+  const chat = useChat();
+  const connect = useEspConnect(s);
 
   const [page, setPage] = useState(pageFromHash);
   const [series, setSeries] = useState("soil");
   const [profileOpen, setProfileOpen] = useState(false);
-  const [accountOpen, setAccountOpen] = useState(false);
+  const [connectOpen, setConnectOpen] = useState(false);
 
   useEffect(() => {
     const onHash = () => setPage(pageFromHash());
@@ -58,6 +51,12 @@ function Dashboard({ auth }) {
     setPage(id);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
+
+  const openConnect = useCallback(() => {
+    connect.stop();
+    connect.reset();
+    setConnectOpen(true);
+  }, [connect]);
 
   useEffect(() => {
     const soil = s.reading?.soilPct;
@@ -98,23 +97,28 @@ function Dashboard({ auth }) {
             <Radio size={14} />
             <span>{s.online ? `Live · ${ago(s.ageMs)}` : s.reading ? "ESP32 offline" : "Waiting for ESP32"}</span>
           </div>
+          <button className="farm-chip" onClick={openConnect} title="Connect the ESP32 manually">
+            <Plug size={15} />
+            <span>Connect ESP</span>
+          </button>
           <button className="farm-chip" onClick={() => setProfileOpen(true)}>
             <Settings2 size={15} />
             <span>{advice.profile.crop || "My farm"}</span>
           </button>
-          <UserMenu
-            user={auth.user}
-            onAccount={() => setAccountOpen(true)}
-            onLogout={auth.logout}
-          />
         </div>
       </header>
 
       {s.staleBackend && (
         <div className="banner" role="alert">
-          <strong>Your backend is running an old version of server.js.</strong> Pump control, mode and
-          history won't work until you restart it: press Ctrl+C in the backend terminal, then run{" "}
-          <code>npm start</code> inside the <code>backend</code> folder.
+          <strong>The backend is running an old version of server.js.</strong> Pump control, mode and
+          history won't work until it is restarted or redeployed.
+        </div>
+      )}
+
+      {!s.staleBackend && s.backendError && !s.reading && (
+        <div className="banner info" role="status">
+          <strong>Connecting to the server…</strong> The free server sleeps when idle and can take up to
+          a minute to wake. This page keeps trying by itself.
         </div>
       )}
 
@@ -123,11 +127,11 @@ function Dashboard({ auth }) {
           <FieldPage
             s={s}
             control={control}
-            canControl={auth.isAdmin}
             advice={advice}
             series={series}
             setSeries={setSeries}
             go={go}
+            onConnect={openConnect}
           />
         )}
         {page === "sensors" && <SensorsPage s={s} series={series} setSeries={setSeries} />}
@@ -141,20 +145,15 @@ function Dashboard({ auth }) {
         <span>
           © {new Date().getFullYear()} SproutIQ — decision support for water-wise farming
         </span>
-        <span className="mono">ESP32 → backend → dashboard</span>
+        <span className="mono">ESP32 → cloud server → dashboard</span>
       </footer>
 
-      <ProfileDrawer
-        open={profileOpen}
-        onClose={() => setProfileOpen(false)}
-        advice={advice}
-        canEdit={auth.isAdmin}
-      />
-      <AccountDrawer
-        open={accountOpen}
-        onClose={() => setAccountOpen(false)}
-        auth={auth}
-        notify={notify}
+      <ProfileDrawer open={profileOpen} onClose={() => setProfileOpen(false)} advice={advice} />
+      <ConnectDrawer
+        open={connectOpen}
+        onClose={() => setConnectOpen(false)}
+        sensors={s}
+        connect={connect}
       />
       <Toasts toasts={toasts} dismiss={dismiss} />
     </div>

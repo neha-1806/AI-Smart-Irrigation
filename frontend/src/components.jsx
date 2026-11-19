@@ -407,11 +407,11 @@ export function FlowPipe({ flow }) {
 
 /* ---------- pump & mode control ---------- */
 
-export function PumpPanel({ reading, online, pending, readOnly = false, onPump, onAuto, onReset }) {
+export function PumpPanel({ reading, online, pending, onPump, onAuto, onReset }) {
   const known = reading !== null;
   const pump = known && reading.pump;
   const auto = known ? reading.auto : null;
-  const locked = readOnly || !online || Boolean(pending);
+  const locked = !online || Boolean(pending);
 
   return (
     <div className={`pump ${pump ? "is-on" : ""}`}>
@@ -430,9 +430,7 @@ export function PumpPanel({ reading, online, pending, readOnly = false, onPump, 
           <span className="mono-label">Pump</span>
           <strong>{pump ? "Running" : "Idle"}</strong>
           <small>
-            {readOnly
-              ? "View only — ask an admin to control the pump"
-              : !online
+            {!online
               ? "ESP32 offline — controls locked"
               : pending?.kind === "pump"
                 ? "Waiting for the ESP32 to confirm…"

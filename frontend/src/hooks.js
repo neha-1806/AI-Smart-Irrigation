@@ -3,7 +3,6 @@ import {
   API_BASE,
   ONLINE_WINDOW_MS,
   fromServerHistory,
-  getToken,
   normalize,
   request,
   toPoint,
@@ -65,7 +64,7 @@ export function useSensors() {
     loadLatest();
     // The pump/mode routes only exist in the current server.js. If they 404 the
     // backend process was started before the update and must be restarted.
-    fetch(`${API_BASE}/api/device/status`, { headers: { Authorization: `Bearer ${getToken()}` } })
+    fetch(`${API_BASE}/api/device/status`)
       .then((response) => setStaleBackend(response.status === 404))
       .catch(() => {});
     request("/api/sensor-history?limit=200")
@@ -77,7 +76,7 @@ export function useSensors() {
   }, [loadLatest]);
 
   useEffect(() => {
-    const socketUrl = `${API_BASE.replace(/^http/, "ws")}/?token=${encodeURIComponent(getToken())}`;
+    const socketUrl = API_BASE.replace(/^http/, "ws");
     let socket;
     let retryTimer;
     let stopped = false;

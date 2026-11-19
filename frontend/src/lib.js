@@ -97,45 +97,15 @@ export function fromServerHistory(p) {
   );
 }
 
-/* ---------- session token (stored in this browser only) ---------- */
-
-const TOKEN_KEY = "sproutiq.token";
-export const UNAUTHORIZED_EVENT = "sproutiq:unauthorized";
-
-export const getToken = () => {
-  try {
-    return localStorage.getItem(TOKEN_KEY) || "";
-  } catch {
-    return "";
-  }
-};
-
-export const setToken = (token) => {
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, token);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    // storage unavailable: the session lasts until the page closes
-  }
-};
-
 export async function request(path, options = {}) {
-  const token = getToken();
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...options.headers,
     },
   });
   const data = await response.json().catch(() => ({}));
-
-  // A rejected token means the session ended (expired, password changed, account removed).
-  if (response.status === 401 && token && !path.startsWith("/api/auth/login")) {
-    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
-  }
-
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
 }

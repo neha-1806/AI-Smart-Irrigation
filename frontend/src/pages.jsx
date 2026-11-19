@@ -107,7 +107,7 @@ const tail = (history, key, n = 40) => history.slice(-n).map((p) => p[key]);
 
 /* ================= FIELD ================= */
 
-export function FieldPage({ s, control, canControl, advice, series, setSeries, go }) {
+export function FieldPage({ s, control, advice, series, setSeries, go, onConnect }) {
   const r = s.reading;
   const [pre, em, post] = headline(r, s.online);
   const rec = advice.recommendation;
@@ -196,7 +196,6 @@ export function FieldPage({ s, control, canControl, advice, series, setSeries, g
             reading={r}
             online={s.online}
             pending={control.pending}
-            readOnly={!canControl}
             onPump={control.setPump}
             onAuto={control.setAuto}
             onReset={control.resetLiters}
@@ -551,7 +550,7 @@ export function AdvicePage({ advice, s }) {
 
 /* ================= PROFILE DRAWER ================= */
 
-export function ProfileDrawer({ open, onClose, advice, canEdit }) {
+export function ProfileDrawer({ open, onClose, advice }) {
   const [draft, setDraft] = useState(advice.profile);
 
   useEffect(() => {
@@ -572,7 +571,6 @@ export function ProfileDrawer({ open, onClose, advice, canEdit }) {
         placeholder={placeholder}
         maxLength={max}
         required={required}
-        disabled={!canEdit}
       />
     </label>
   );
@@ -596,17 +594,11 @@ export function ProfileDrawer({ open, onClose, advice, canEdit }) {
           {field("city", "City (for weather)", "e.g. Sonipat", 100, true)}
           {field("farmArea", "Farm area", "e.g. 1 acre", 50)}
           {advice.errors.profile && <p className="form-error">{advice.errors.profile}</p>}
-          {canEdit ? (
-            <>
-              <button className="primary" type="submit" disabled={advice.loading.profile}>
-                {advice.loading.profile ? <LoaderCircle size={16} className="spin" /> : null}
-                Save profile
-              </button>
-              <p className="muted small">Saved on the backend for this server session.</p>
-            </>
-          ) : (
-            <p className="muted small">Only an admin can change the farm profile.</p>
-          )}
+          <button className="primary" type="submit" disabled={advice.loading.profile}>
+            {advice.loading.profile ? <LoaderCircle size={16} className="spin" /> : null}
+            Save profile
+          </button>
+          <p className="muted small">Saved on the server, so it is still there after a restart.</p>
         </form>
       </aside>
     </>
