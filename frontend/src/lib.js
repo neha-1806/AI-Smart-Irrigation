@@ -3,8 +3,12 @@
 
 const host = typeof window !== "undefined" ? window.location.hostname || "localhost" : "localhost";
 
+// On Vercel the backend is the Render service; anywhere else it is port 3000 on the same machine.
+const DEPLOYED_API = "https://ai-smart-irrigation.onrender.com";
+
 export const API_BASE = (
-  import.meta.env.VITE_API_BASE_URL || `http://${host}:3000`
+  import.meta.env.VITE_API_BASE_URL ||
+  (host.endsWith(".vercel.app") ? DEPLOYED_API : `http://${host}:3000`)
 ).replace(/\/$/, "");
 
 export const THRESHOLDS = {

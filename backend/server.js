@@ -36,6 +36,12 @@ app.use(
         origin: [
             "http://localhost:5173",
             "http://127.0.0.1:5173",
+            // Deployed dashboard (Vercel). Add more with CORS_ORIGINS=a,b in the environment.
+            "https://ai-smart-irrigation-snowy.vercel.app",
+            ...String(process.env.CORS_ORIGINS || "")
+                .split(",")
+                .map((origin) => origin.trim().replace(/\/$/, ""))
+                .filter(Boolean),
             // Dashboard opened from another device on the same Wi-Fi
             // (e.g. http://192.168.1.4:5173 on a phone).
             /^http:\/\/(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):5173$/
