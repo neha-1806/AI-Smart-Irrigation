@@ -6,22 +6,181 @@ const http = require("http");
 const WebSocket = require("ws");
 const cors = require("cors");
 const { GoogleGenAI } = require("@google/genai");
+const {
+    createAuthRouter,
+    requireAuth,
+    requireRole,
+    verifyToken
+} = require("./auth");
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+
+// Only signed-in users may open the live-data socket. Browsers cannot set
+// headers on a WebSocket, so the token travels as ?token=...
+const wss = new WebSocket.Server({
+    server,
+    verifyClient: ({ req }, done) => {
+        const token = new URL(req.url, "http://localhost").searchParams.get("token");
+        const user = verifyToken(token);
+
+        if (!user) return done(false, 401, "Unauthorized");
+
+        req.authUser = user.userId;
+        done(true);
+    }
+});
 
 app.use(
     cors({
         origin: [
             "http://localhost:5173",
-            "http://127.0.0.1:5173"
+            "http://127.0.0.1:5173",
+            // Dashboard opened from another device on the same Wi-Fi
+            // (e.g. http://192.168.1.4:5173 on a phone).
+            /^http:\/\/(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):5173$/
         ]
     })
 );
 app.use(express.json({ limit: "1mb" }));
 
+// --------------------------------------------------
+// ACCESS CONTROL
+// --------------------------------------------------
+// Everything under /api needs a signed-in user, except:
+//   - the ESP32 posting its readings (the firmware has no login), and
+//   - the sign-in / sign-up calls themselves.
+// Role rules (admin vs viewer) are applied on the individual routes.
+
+const PUBLIC_API = new Set([
+    "POST /api/sensor-data",
+    "GET /api/auth/status",
+    "POST /api/auth/login",
+    "POST /api/auth/register"
+]);
+
+app.use("/api", (req, res, next) => {
+    const route = `${req.method} ${req.baseUrl}${req.path}`.replace(/\/+$/, "");
+
+    if (PUBLIC_API.has(route)) return next();
+
+    requireAuth(req, res, next);
+});
+
+app.use(
+    "/api/auth",
+    createAuthRouter({
+        // A deleted user's open live-data sockets are closed immediately.
+        onUserRemoved: (userId) => {
+            wss.clients.forEach((client) => {
+                if (client.authUser === userId) client.close(4401, "Account removed");
+            });
+        }
+    })
+);
+
+const adminOnly = requireRole("admin");
+
 let latestSensorData = null;
+let lastSensorAt = 0; // Date.now() of the last ESP32 packet
+
+// Keeps the most recent readings so the dashboard can draw trends.
+const SENSOR_HISTORY_LIMIT = 300;
+let sensorHistory = [];
+
+// --------------------------------------------------
+// ESP32 DEVICE SYNC
+// --------------------------------------------------
+// The ESP32 POSTs its readings every couple of seconds. The backend
+// answers each POST with any pending dashboard commands (pump on/off,
+// auto/manual mode, reset litres). The ESP32 applies them exactly like
+// its own local web page does and reports back the highest command id it
+// handled (lastCmdId), which lets the backend drop them from the queue.
+
+const DEVICE_ONLINE_MS = 15000;   // no packet for this long => device offline
+const COMMAND_TTL_MS = 60000;     // un-acknowledged commands expire
+const COMMAND_QUEUE_LIMIT = 10;
+
+let commandQueue = [];
+// Start from the clock (seconds) so ids keep increasing across backend
+// restarts; the ESP32 ignores ids at or below the last one it applied.
+let nextCommandId = Math.floor(Date.now() / 1000);
+
+// Same thresholds / calibration as the ESP32 firmware.
+const SOIL_DRY_RAW = 3800;
+const SOIL_WET_RAW = 1500;
+const PUMP_ON_THRESHOLD = 35;
+const PUMP_OFF_THRESHOLD = 60;
+
+function isDeviceOnline() {
+    return lastSensorAt > 0 && Date.now() - lastSensorAt < DEVICE_ONLINE_MS;
+}
+
+function pruneCommands() {
+    const now = Date.now();
+    commandQueue = commandQueue.filter(
+        (command) => now - command.createdAt < COMMAND_TTL_MS
+    );
+}
+
+function enqueueCommand(type, value) {
+    pruneCommands();
+
+    const command = {
+        id: nextCommandId++,
+        type,
+        value,
+        createdAt: Date.now()
+    };
+
+    commandQueue.push(command);
+
+    if (commandQueue.length > COMMAND_QUEUE_LIMIT) {
+        commandQueue = commandQueue.slice(-COMMAND_QUEUE_LIMIT);
+    }
+
+    return command;
+}
+
+function toBoolean(value) {
+    if (typeof value === "boolean") return value;
+    if (value === 1 || value === "1" || value === "true") return true;
+    if (value === 0 || value === "0" || value === "false") return false;
+    return null;
+}
+
+function truthyFlag(value) {
+    return value === true || value === 1 || value === "1" || value === "true";
+}
+
+function soilPercentFrom(data) {
+    if (!data) return null;
+
+    const percent = Number(data.soilPercent);
+    if (data.soilPercent !== undefined && data.soilPercent !== null && Number.isFinite(percent)) {
+        return Math.min(100, Math.max(0, percent));
+    }
+
+    const raw = Number(data.soil);
+    if (data.soil === undefined || data.soil === null || !Number.isFinite(raw)) {
+        return null;
+    }
+
+    const mapped =
+        ((raw - SOIL_DRY_RAW) * 100) / (SOIL_WET_RAW - SOIL_DRY_RAW);
+
+    return Math.min(100, Math.max(0, Math.round(mapped)));
+}
+
+function broadcast(payload) {
+    const message = JSON.stringify(payload);
+
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
 
 let farmProfile = {
     crop: "",
@@ -39,8 +198,14 @@ app.get("/", (req, res) => {
         message: "Smart Irrigation Backend is running",
         aiProvider: "Gemini",
         endpoints: [
-            "GET /api/sensor-data",
-            "POST /api/sensor-data",
+            "POST /api/auth/register | /api/auth/login | GET /api/auth/me",
+            "GET /api/sensor-data   (sign-in required; so is everything below except the ESP32 post)",
+            "POST /api/sensor-data   (ESP32 -> backend, replies with pending commands)",
+            "GET /api/sensor-history",
+            "GET /api/device/status",
+            "POST /api/device/pump   { state: true|false }",
+            "POST /api/device/mode   { auto: true|false }",
+            "POST /api/device/reset-flow",
             "GET /api/weather?city=Sonipat",
             "GET /api/smart-recommendation?city=Sonipat",
             "GET /api/farm-profile",
@@ -65,32 +230,148 @@ app.post("/api/sensor-data", (req, res) => {
         });
     }
 
+    // lastCmdId is device bookkeeping, not a sensor reading.
+    const { lastCmdId, ...reading } = req.body;
+
+    if (typeof reading.tip === "string") {
+        reading.tip = reading.tip.slice(0, 300);
+    }
+
+    lastSensorAt = Date.now();
     latestSensorData = {
-        ...req.body,
-        receivedAt: new Date().toISOString()
+        ...reading,
+        receivedAt: new Date(lastSensorAt).toISOString()
     };
 
-    const message = JSON.stringify({
-        type: "sensor-data",
-        data: latestSensorData
-    });
+    // Drop commands the ESP32 has already applied (and expired ones).
+    const acked = Number(lastCmdId);
+    if (Number.isFinite(acked)) {
+        commandQueue = commandQueue.filter((command) => command.id > acked);
+    }
+    pruneCommands();
 
-    wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(message);
+    const historyPoint = { t: lastSensorAt };
+    for (const key of [
+        "soil", "soilPercent", "ph", "temperature", "humidity", "flow", "totalLiters"
+    ]) {
+        const value = Number(latestSensorData[key]);
+        if (latestSensorData[key] !== null && latestSensorData[key] !== undefined && Number.isFinite(value)) {
+            historyPoint[key] = value;
         }
+    }
+    historyPoint.pump = truthyFlag(latestSensorData.pump) ? 1 : 0;
+    historyPoint.rain = truthyFlag(latestSensorData.rain) ? 1 : 0;
+
+    sensorHistory.push(historyPoint);
+    if (sensorHistory.length > SENSOR_HISTORY_LIMIT) {
+        sensorHistory = sensorHistory.slice(-SENSOR_HISTORY_LIMIT);
+    }
+
+    broadcast({
+        type: "sensor-data",
+        data: latestSensorData,
+        online: true
     });
 
-    console.log("Sensor data received:", latestSensorData);
+    console.log(
+        `Sensor data received: soil=${latestSensorData.soil} (${latestSensorData.soilPercent}%) ` +
+        `pump=${latestSensorData.pump} auto=${latestSensorData.autoMode} ` +
+        `pendingCommands=${commandQueue.length}`
+    );
 
+    // Small reply: the ESP32 only needs the pending commands.
     res.json({
         message: "Sensor data received successfully",
-        data: latestSensorData
+        receivedAt: latestSensorData.receivedAt,
+        commands: commandQueue.map(({ id, type, value }) => ({ id, type, value }))
     });
 });
 
 app.get("/api/sensor-data", (req, res) => {
-    res.json({ data: latestSensorData });
+    res.json({
+        data: latestSensorData,
+        online: isDeviceOnline(),
+        ageMs: lastSensorAt ? Date.now() - lastSensorAt : null
+    });
+});
+
+app.get("/api/sensor-history", (req, res) => {
+    const limit = Math.min(
+        SENSOR_HISTORY_LIMIT,
+        Math.max(1, Number(req.query.limit) || 120)
+    );
+
+    res.json({ history: sensorHistory.slice(-limit) });
+});
+
+// --------------------------------------------------
+// DEVICE CONTROL (dashboard -> ESP32)
+// --------------------------------------------------
+
+function rejectIfOffline(res) {
+    if (isDeviceOnline()) return false;
+
+    res.status(503).json({
+        error:
+            "The ESP32 is offline, so the command was not sent. Check its power and Wi-Fi."
+    });
+
+    return true;
+}
+
+app.get("/api/device/status", (req, res) => {
+    pruneCommands();
+
+    res.json({
+        online: isDeviceOnline(),
+        lastSeen: lastSensorAt ? new Date(lastSensorAt).toISOString() : null,
+        ageMs: lastSensorAt ? Date.now() - lastSensorAt : null,
+        pendingCommands: commandQueue.length
+    });
+});
+
+// Manual pump switch. Like the ESP32's own /pump page this also leaves AUTO mode.
+app.post("/api/device/pump", adminOnly, (req, res) => {
+    const state = toBoolean(req.body?.state);
+
+    if (state === null) {
+        return res.status(400).json({
+            error: "Send { \"state\": true } or { \"state\": false }."
+        });
+    }
+
+    if (rejectIfOffline(res)) return;
+
+    const command = enqueueCommand("pump", state ? 1 : 0);
+    console.log(`Dashboard command #${command.id}: pump ${state ? "ON" : "OFF"} (manual)`);
+
+    res.json({ message: "Pump command queued for the ESP32.", command });
+});
+
+app.post("/api/device/mode", adminOnly, (req, res) => {
+    const auto = toBoolean(req.body?.auto);
+
+    if (auto === null) {
+        return res.status(400).json({
+            error: "Send { \"auto\": true } or { \"auto\": false }."
+        });
+    }
+
+    if (rejectIfOffline(res)) return;
+
+    const command = enqueueCommand("mode", auto ? 1 : 0);
+    console.log(`Dashboard command #${command.id}: ${auto ? "AUTO" : "MANUAL"} mode`);
+
+    res.json({ message: "Mode command queued for the ESP32.", command });
+});
+
+app.post("/api/device/reset-flow", adminOnly, (req, res) => {
+    if (rejectIfOffline(res)) return;
+
+    const command = enqueueCommand("resetFlow", 1);
+    console.log(`Dashboard command #${command.id}: reset litres`);
+
+    res.json({ message: "Reset command queued for the ESP32.", command });
 });
 
 // --------------------------------------------------
@@ -101,7 +382,7 @@ app.get("/api/farm-profile", (req, res) => {
     res.json({ profile: farmProfile });
 });
 
-app.post("/api/farm-profile", (req, res) => {
+app.post("/api/farm-profile", adminOnly, (req, res) => {
     const { crop, soilType, city, farmArea } = req.body || {};
 
     farmProfile = {
@@ -202,98 +483,147 @@ app.get("/api/smart-recommendation", async (req, res) => {
         });
     }
 
+    const city = req.query.city || farmProfile.city || "Sonipat";
+
+    // Weather is extra context only: the recommendation must still work
+    // from the ESP32 readings when the weather service is unreachable.
+    let weather = null;
+    let weatherError = null;
+
     try {
-        const city =
-            req.query.city || farmProfile.city || "Sonipat";
-
-        const weather = await getWeather(city);
-        const soil = Number(latestSensorData.soil);
-        const rainRaw = latestSensorData.rain;
-
-        const crop = farmProfile.crop || "unspecified crop";
-        const soilType =
-            farmProfile.soilType || "unspecified soil";
-
-        let recommendation = "Check soil moisture and crop needs";
-        const reasons = [];
-
-        const cautions = [
-            "Soil thresholds are provisional and must be calibrated for the installed sensor.",
-            "This endpoint uses current weather, not a rainfall forecast."
-        ];
-
-        if (!Number.isFinite(soil)) {
-            recommendation = "Check the soil sensor";
-            reasons.push(
-                "The soil sensor value is missing or not numeric."
-            );
-        } else if (
-            weather.conditionMain.toLowerCase().includes("rain") ||
-            weather.conditionMain.toLowerCase().includes("drizzle")
-        ) {
-            recommendation = "Check soil moisture before watering";
-            reasons.push(
-                "Current weather reports rain or drizzle; avoid deciding from weather alone."
-            );
-        } else if (soil >= 3000) {
-            recommendation =
-                "Water may be needed; verify the soil first";
-            reasons.push(
-                "Raw soil ADC reading is above the provisional dry-soil threshold."
-            );
-        } else if (soil <= 2000) {
-            recommendation =
-                "Watering may not be needed right now";
-            reasons.push(
-                "Raw soil ADC reading is below the provisional threshold."
-            );
-        } else {
-            recommendation = "Monitor soil moisture";
-            reasons.push(
-                "Raw soil ADC reading is within the provisional middle range."
-            );
-        }
-
-        if (rainRaw !== undefined && rainRaw !== null) {
-            reasons.push(
-                `Rain sensor raw value: ${String(rainRaw)}. Interpret only after hardware calibration.`
-            );
-        }
-
-        if (latestSensorData.ph !== undefined) {
-            reasons.push(
-                "Water pH reading is available, but it is not the same as soil pH and is not used to decide watering."
-            );
-        }
-
-        res.json({
-            city: weather.city,
-            recommendation,
-            reasons,
-            farmProfile: {
-                crop,
-                soilType,
-                farmArea: farmProfile.farmArea || "not specified"
-            },
-            sensorData: latestSensorData,
-            weather: {
-                temperature: weather.temperature,
-                humidity: weather.humidity,
-                condition: weather.condition,
-                windSpeed: weather.windSpeed
-            },
-            cautions
-        });
+        weather = await getWeather(city);
     } catch (error) {
-        console.error(
-            "Smart recommendation error:",
-            error.message
-        );
-
-        res.status(502).json({
-            error: error.message
-        });
+        weatherError = error.message;
+        console.error("Weather unavailable for recommendation:", error.message);
     }
+
+    const online = isDeviceOnline();
+    const soilPct = soilPercentFrom(latestSensorData);
+    const raining = truthyFlag(latestSensorData.rain);
+    const pumpOn = truthyFlag(latestSensorData.pump);
+    const autoMode = truthyFlag(latestSensorData.autoMode);
+    const ph = Number(latestSensorData.ph);
+    const hasPh =
+        latestSensorData.ph !== undefined &&
+        latestSensorData.ph !== null &&
+        Number.isFinite(ph);
+
+    const crop = farmProfile.crop || "unspecified crop";
+    const soilType = farmProfile.soilType || "unspecified soil";
+
+    const weatherSaysRain = weather
+        ? /rain|drizzle|thunderstorm/i.test(weather.conditionMain)
+        : false;
+
+    let recommendation;
+    let level; // "water" | "hold" | "ok" | "check"
+    const reasons = [];
+
+    const cautions = [
+        "Soil percentage is mapped from the ESP32's dry/wet calibration (raw 3800 = 0%, raw 1500 = 100%); recalibrate if the sensor or soil changes.",
+        "Weather is the current condition only, not a rainfall forecast."
+    ];
+
+    if (!online) {
+        cautions.unshift(
+            "The ESP32 has not reported recently, so these readings may be out of date."
+        );
+    }
+
+    if (weatherError) {
+        cautions.push(`Weather data unavailable (${weatherError}).`);
+    }
+
+    if (soilPct === null) {
+        recommendation = "Check the soil sensor";
+        level = "check";
+        reasons.push("The soil sensor value is missing or not numeric.");
+    } else if (raining) {
+        recommendation = "Rain detected: keep the pump off";
+        level = "hold";
+        reasons.push(
+            "The rain sensor is wet, so automatic irrigation is paused to avoid waterlogging."
+        );
+    } else if (soilPct < PUMP_ON_THRESHOLD) {
+        recommendation = pumpOn
+            ? "Soil is dry: irrigation is running"
+            : "Soil is dry: irrigation needed";
+        level = "water";
+        reasons.push(
+            `Soil moisture is ${soilPct}%, below the ${PUMP_ON_THRESHOLD}% pump-on threshold.`
+        );
+    } else if (soilPct > PUMP_OFF_THRESHOLD) {
+        recommendation = "Soil is moist: no watering needed";
+        level = "ok";
+        reasons.push(
+            `Soil moisture is ${soilPct}%, above the ${PUMP_OFF_THRESHOLD}% pump-off threshold.`
+        );
+    } else {
+        recommendation = "Soil moisture is in range: keep monitoring";
+        level = "ok";
+        reasons.push(
+            `Soil moisture is ${soilPct}%, between the ${PUMP_ON_THRESHOLD}% and ${PUMP_OFF_THRESHOLD}% thresholds.`
+        );
+    }
+
+    if (weatherSaysRain && !raining) {
+        reasons.push(
+            "The weather service reports rain nearby; the field rain sensor is still dry."
+        );
+        if (level === "water") {
+            recommendation += " (rain reported nearby)";
+        }
+    }
+
+    if (weather && weather.temperature > 35 && level === "water") {
+        reasons.push(
+            "It is hot (above 35 °C); watering in the evening reduces evaporation."
+        );
+    }
+
+    reasons.push(
+        `Pump is ${pumpOn ? "ON" : "OFF"} in ${autoMode ? "AUTO" : "MANUAL"} mode.`
+    );
+
+    if (hasPh) {
+        let phNote = `Water pH reads ${ph.toFixed(1)}.`;
+
+        if (ph < 5.5) phNote += " That is acidic; agricultural lime may help the soil.";
+        else if (ph > 8.0) phNote += " That is alkaline; gypsum or organic compost may help.";
+        else phNote += " That is in the normal range.";
+
+        reasons.push(phNote);
+        cautions.push(
+            "pH is measured in water or a soil slurry, not directly in the field soil."
+        );
+    }
+
+    if (typeof latestSensorData.tip === "string" && latestSensorData.tip.trim()) {
+        reasons.push(`ESP32 tip: ${latestSensorData.tip.trim()}`);
+    }
+
+    res.json({
+        city: weather?.city || city,
+        recommendation,
+        level,
+        soilPercent: soilPct,
+        reasons,
+        farmProfile: {
+            crop,
+            soilType,
+            farmArea: farmProfile.farmArea || "not specified"
+        },
+        sensorData: latestSensorData,
+        weather: weather
+            ? {
+                  temperature: weather.temperature,
+                  humidity: weather.humidity,
+                  condition: weather.condition,
+                  windSpeed: weather.windSpeed
+              }
+            : null,
+        cautions
+    });
 });
 
 // --------------------------------------------------
@@ -318,6 +648,24 @@ app.post("/api/chat", async (req, res) => {
         });
     }
 
+    // Optional earlier turns so follow-up questions keep their context.
+    const conversation = Array.isArray(req.body?.history)
+        ? req.body.history
+              .slice(-10)
+              .filter(
+                  (turn) =>
+                      turn &&
+                      (turn.role === "user" || turn.role === "assistant") &&
+                      typeof turn.text === "string" &&
+                      turn.text.trim()
+              )
+              .map(
+                  (turn) =>
+                      `${turn.role === "user" ? "User" : "Assistant"}: ${turn.text.trim().slice(0, 1500)}`
+              )
+              .join("\n")
+        : "";
+
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey || !apiKey.trim()) {
@@ -327,8 +675,11 @@ app.post("/api/chat", async (req, res) => {
     }
 
     try {
+        // "gemini-flash-lite-latest" and the Interactions API are only
+        // served on the v1beta API version.
         const ai = new GoogleGenAI({
-            apiKey: apiKey.trim()
+            apiKey: apiKey.trim(),
+            apiVersion: "v1beta"
         });
 
         const prompt = `
@@ -346,7 +697,14 @@ plant diagnoses or local regulations.
 Explain uncertainty when necessary.
 Recommend a local agricultural expert for serious crop
 disease or pesticide decisions.
-Never claim that you control the irrigation pump.
+You cannot switch the pump yourself. If the user wants to change it,
+tell them to use the pump and mode controls on the dashboard.
+The sensor data below comes from the farm's ESP32: "soil" is the raw
+ADC value, "soilPercent" is moisture (the pump turns on below 35%
+and off above 60% in AUTO mode), "rain" 1 means rain is detected,
+"ldr" 1 means daylight, "flow" is litres per minute, "pump" 1 means
+the pump is running and "autoMode" 1 means automatic control.
+Device online: ${isDeviceOnline() ? "yes" : "no (the readings may be stale)"}
 
 Farm profile:
 ${JSON.stringify(farmProfile)}
@@ -354,13 +712,14 @@ ${JSON.stringify(farmProfile)}
 Latest sensor data:
 ${JSON.stringify(latestSensorData)}
 
-Question:
+${conversation ? `Conversation so far:\n${conversation}\n` : ""}
+Latest question:
 ${question.trim()}
 `;
 
         
 const interaction = await ai.interactions.create({
-  model: "gemini-3.8-flash",
+  model: "gemini-flash-lite-latest",
   input: prompt,
 });
 
@@ -392,7 +751,9 @@ const answer = interaction.output_text;
 // WEBSOCKET
 // --------------------------------------------------
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+    ws.authUser = req.authUser;
+
     ws.send(
         JSON.stringify({
             type: "connection",
@@ -404,7 +765,9 @@ wss.on("connection", (ws) => {
         ws.send(
             JSON.stringify({
                 type: "sensor-data",
-                data: latestSensorData
+                data: latestSensorData,
+                online: isDeviceOnline(),
+                ageMs: Date.now() - lastSensorAt
             })
         );
     }

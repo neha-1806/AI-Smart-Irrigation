@@ -158,13 +158,16 @@ flowchart TD
 AI-Smart-Irrigation/
 ├── frontend/
 │   ├── src/
-│   │   └── App.jsx
+│   │   ├── App.jsx
+│   │   ├── auth.jsx           # sign-in page, user menu, account drawer
+│   │   └── ...
 │   ├── package.json
 │   ├── package-lock.json
 │   └── vite.config.js
 │
 ├── backend/
 │   ├── server.js
+│   ├── auth.js                # accounts, tokens, roles
 │   ├── package.json
 │   ├── package-lock.json
 │   └── .env                 # Local secrets; do not commit
@@ -257,7 +260,7 @@ Keep the backend and frontend running in separate terminals.
 
 ## 🔌 API Documentation
 
-The following table describes the intended API interface. Confirm each route against the current `backend/server.js` before treating it as a fully implemented endpoint.
+Every `/api` route requires a signed-in user (see [Sign-in and roles](#sign-in-and-roles)), except the ESP32 posting its readings and the sign-in / sign-up calls. Send the token as `Authorization: Bearer <token>`.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
@@ -269,6 +272,47 @@ The following table describes the intended API interface. Confirm each route aga
 | GET | `/api/weather` | Retrieve weather information |
 | GET | `/api/smart-recommendation` | Retrieve irrigation guidance |
 | POST | `/api/chat` | Submit a question to the AI assistant |
+| POST | `/api/auth/register` | Create an account (the first one becomes admin) |
+| POST | `/api/auth/login` | Sign in, returns a token |
+| GET | `/api/auth/me` | Current user and role |
+
+### ESP32 ↔ backend protocol
+
+The firmware in `firmware/smart_irrigation_esp32/` POSTs its readings to `/api/sensor-data` every 2 seconds
+(`soil` raw ADC, `soilPercent`, `ph`, `temperature`, `humidity`, `rain`, `ldr`, `flow`, `totalLiters`, `pump`, `autoMode`, `tip`).
+The reply carries any pending dashboard commands, which the ESP32 applies exactly like its own web page does:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/sensor-history` | Recent readings for the trend chart |
+| GET | `/api/device/status` | ESP32 online state and pending commands |
+| POST | `/api/device/pump` | `{ "state": true }` manual pump on/off (leaves AUTO mode) |
+| POST | `/api/device/mode` | `{ "auto": true }` switch AUTO / MANUAL |
+| POST | `/api/device/reset-flow` | Reset the litres counter |
+
+Set `ssid`, `password` and `BACKEND_HOST` (your PC's LAN IP) at the top of the sketch, run `npm start` in `backend/`,
+and flash the board. Commands are rejected with 503 while the ESP32 has been silent for more than 15 seconds.
+
+### Sign-in and roles
+
+The dashboard opens on a sign-in page. Accounts use a **user ID and password**:
+
+- Passwords are stored as salted scrypt hashes in `backend/data/users.json` (git-ignored), never in plain text.
+- A session is a signed token (7 days) kept in the browser. Changing your password signs out your other devices.
+- Five wrong passwords for the same user ID and address lock sign-in for 5 minutes.
+- The **first account created becomes the admin**. Later sign-ups are **viewers**. Set `ALLOW_SIGNUP=false` in `backend/.env` to close sign-up once your team has accounts.
+- Set `AUTH_SECRET` (16+ characters) in `backend/.env` to choose your own signing secret; otherwise one is generated into `backend/data/`.
+
+| | Viewer | Admin |
+|---|:---:|:---:|
+| Live readings, history, weather, recommendation | yes | yes |
+| AI assistant | yes | yes |
+| Pump on/off, AUTO/MANUAL, reset litres | no | yes |
+| Edit farm profile | no | yes |
+| Manage users (roles, delete) | no | yes |
+
+The live-data WebSocket needs the token too (`ws://host:3000/?token=...`).
+The ESP32 firmware has no login, so `POST /api/sensor-data` stays open to devices on your network; keep the backend off the public internet.
 
 ### Example: Submit Sensor Data
 
@@ -310,6 +354,7 @@ Example request:
 ```bash
 curl -X POST http://localhost:3000/api/chat \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
   -d "{\"question\":\"How can I improve soil moisture management?\"}"
 ```
 
@@ -330,7 +375,7 @@ AI responses require a working Gemini integration and valid API configuration.
 - Add `.env` to `.gitignore`.
 - Never expose private API keys in frontend code or public commits.
 - Validate incoming sensor readings before using them for decisions.
-- Configure appropriate CORS rules and authentication before public deployment.
+- Sign-in is built in (see above), but serve the app over HTTPS and keep the backend private before any public deployment.
 - Check sensor calibration before interpreting raw readings as actual soil moisture.
 - Treat AI-generated guidance as assistance, not a substitute for agricultural expertise.
 - Demo data, if used, must not be presented as live hardware readings.
